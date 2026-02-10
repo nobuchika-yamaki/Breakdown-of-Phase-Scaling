@@ -1,0 +1,184 @@
+import numpy as np
+import pandas as pd
+from pathlib import Path
+from multiprocessing import Pool, cpu_count
+
+# =========================
+# Global parameters (Methods exact)
+# =========================
+dt = 0.001
+T = 220.0
+steps = int(T / dt)
+
+discard_sec = 90.0
+discard_steps = int(discard_sec / dt)
+
+baseline_start_sec = 40.0
+baseline_end_sec   = 90.0
+baseline_start = int(baseline_start_sec / dt)
+baseline_end   = int(baseline_end_sec / dt)
+
+phase_threshold = 1.8
+
+sigma_tau = 0.002
+tau_min, tau_max = 0.001, 0.080
+
+frequencies = [5, 10, 20, 40]
+trials = 20
+C = 0.2
+noise_sigma = 0.4
+
+w_EE, w_EI, w_IE, w_II = 8.0, 12.0, 10.0, 2.0
+
+OUTDIR = Path.home() / "Desktop"
+
+# =========================
+# Utilities
+# =========================
+def S(x):
+    return 0.5 * (1 + np.tanh(x / 2))
+
+def wrap_abs(x):
+    return abs((x + np.pi) % (2 * np.pi) - np.pi)
+
+# =========================
+# Phase model (delay buffer, exact)
+# =========================
+def run_phase(args):
+    fL, trial = args
+    rng = np.random.default_rng(trial)
+
+    fR = fL + 1.0
+    omegaL = 2 * np.pi * fL
+    omegaR = 2 * np.pi * fR
+
+    phiL = 0.0
+    phiR = 0.0
+    tau = 0.01
+
+    kmax = int(tau_max / dt) + 2
+    bufL = np.zeros(kmax)
+    bufR = np.zeros(kmax)
+    bi = 0
+    sqrt_dt = np.sqrt(dt)
+
+    for t in range(steps):
+        tau += sigma_tau * sqrt_dt * rng.standard_normal()
+        tau = float(np.clip(tau, tau_min, tau_max))
+        k = max(1, min(int(tau / dt), kmax - 2))
+
+        phiL_d = bufL[(bi - k) % kmax]
+        phiR_d = bufR[(bi - k) % kmax]
+
+        phiL += (omegaL + C * np.sin(phiR_d - phiL)) * dt
+        phiR += (omegaR + C * np.sin(phiL_d - phiR)) * dt
+
+        bi = (bi + 1) % kmax
+        bufL[bi] = phiL
+        bufR[bi] = phiR
+
+        if t > discard_steps and wrap_abs(phiL - phiR) > phase_threshold:
+            return tau * 1000.0  # ms
+
+    return np.nan
+
+# =========================
+# Wilson–Cowan model (Methods exact)
+# =========================
+def run_wc(args):
+    fL, trial, tauE = args
+    rng = np.random.default_rng(trial)
+    tauI = tauE
+    fR = fL + 1.0
+
+    EL, IL, ER, IR = rng.uniform(0.1, 0.2, 4)
+    tau = 0.01
+
+    kmax = int(tau_max / dt) + 2
+    bufL = np.full(kmax, EL)
+    bufR = np.full(kmax, ER)
+    bi = 0
+    sqrt_dt = np.sqrt(dt)
+
+    ELb, ILb, ERb, IRb = [], [], [], []
+
+    for t in range(steps):
+        tau += sigma_tau * sqrt_dt * rng.standard_normal()
+        tau = float(np.clip(tau, tau_min, tau_max))
+        k = max(1, min(int(tau / dt), kmax - 2))
+
+        ELd = bufL[(bi - k) % kmax]
+        ERd = bufR[(bi - k) % kmax]
+
+        PL = np.sin(2 * np.pi * fL * t * dt) + noise_sigma * rng.standard_normal()
+        PR = np.sin(2 * np.pi * fR * t * dt) + noise_sigma * rng.standard_normal()
+
+        EL += (-EL + S(w_EE * EL - w_EI * IL + C * (ERd - EL) + PL)) * dt / tauE
+        IL += (-IL + S(w_IE * EL - w_II * IL)) * dt / tauI
+        ER += (-ER + S(w_EE * ER - w_EI * IR + C * (ELd - ER) + PR)) * dt / tauE
+        IR += (-IR + S(w_IE * ER - w_II * IR)) * dt / tauI
+
+        bi = (bi + 1) % kmax
+        bufL[bi] = EL
+        bufR[bi] = ER
+
+        if baseline_start <= t < baseline_end:
+            ELb.append(EL); ILb.append(IL)
+            ERb.append(ER); IRb.append(IR)
+
+        if t > discard_steps and len(ELb) > 0:
+            phiL = np.arctan2(IL - np.mean(ILb), EL - np.mean(ELb))
+            phiR = np.arctan2(IR - np.mean(IRb), ER - np.mean(ERb))
+            if wrap_abs(phiL - phiR) > phase_threshold:
+                return tau * 1000.0  # ms
+
+    return np.nan
+
+# =========================
+# Main execution
+# =========================
+if __name__ == "__main__":
+    rows = []
+
+    jobs_phase = [(f, tr) for f in frequencies for tr in range(trials)]
+    jobs_wc10  = [(f, tr, 0.01) for f in frequencies for tr in range(trials)]
+    jobs_wc20  = [(f, tr, 0.02) for f in frequencies for tr in range(trials)]
+
+    with Pool(cpu_count()) as p:
+        res_phase = p.map(run_phase, jobs_phase)
+        res_wc10  = p.map(run_wc, jobs_wc10)
+        res_wc20  = p.map(run_wc, jobs_wc20)
+
+    idx = 0
+    for f in frequencies:
+        for tr in range(trials):
+            rows.append([f, tr, "Phase",    res_phase[idx]])
+            rows.append([f, tr, "WC_10ms",  res_wc10[idx]])
+            rows.append([f, tr, "WC_20ms",  res_wc20[idx]])
+            idx += 1
+
+    df = pd.DataFrame(rows, columns=["frequency", "trial", "model", "taucrit_ms"])
+    df.to_csv(OUTDIR / "all_trials_taucrit.csv", index=False)
+
+    # ===== summary (NaN excluded) =====
+    summary = []
+    for (f, m), g in df.groupby(["frequency", "model"]):
+        v = g["taucrit_ms"].dropna()
+        summary.append({
+            "frequency": f,
+            "model": m,
+            "n_total": len(g),
+            "n_detect": len(v),
+            "mean": v.mean(),
+            "std": v.std(),
+            "median": v.median(),
+            "min": v.min(),
+            "max": v.max(),
+            "f_tau_mean": f * v.mean() if len(v) > 0 else np.nan
+        })
+
+    pd.DataFrame(summary).to_csv(OUTDIR / "summary_taucrit.csv", index=False)
+
+    print("Saved to Desktop:")
+    print(" - all_trials_taucrit.csv")
+    print(" - summary_taucrit.csv")
